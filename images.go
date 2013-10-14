@@ -2,6 +2,11 @@ package gophercloud
 
 import (
 	"github.com/racker/perigee"
+	"io"
+	"mime/multipart"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 // See the CloudImagesProvider interface for details.
@@ -9,7 +14,12 @@ func (gsp *genericServersProvider) ListImages() ([]Image, error) {
 	var is []Image
 
 	err := gsp.context.WithReauth(gsp.access, func() error {
-		url := gsp.endpoint + "/images/detail"
+		var url string
+		if strings.HasSuffix(gsp.endpoint, "v1") {
+			url = gsp.endpoint + "/images/details"
+		} else {
+			url = gsp.endpoint + "/images"
+		}
 		return perigee.Get(url, perigee.Options{
 			CustomClient: gsp.context.httpClient,
 			Results:      &struct{ Images *[]Image }{&is},
@@ -35,6 +45,120 @@ func (gsp *genericServersProvider) ImageById(id string) (*Image, error) {
 		})
 	})
 	return is, err
+}
+
+func (gsp *genericServersProvider) CreateNewImage(ni NewImage) (string, error) {
+	response, err := gsp.context.ResponseWithReauth(gsp.access, func() (*perigee.Response, error) {
+		url := gsp.endpoint + "/images"
+		return perigee.Request("POST", url, perigee.Options{
+			ReqBody: &struct {
+				*NewImage `json:""`
+			}{&ni},
+			CustomClient: gsp.context.httpClient,
+			MoreHeaders: map[string]string{
+				"X-Auth-Token": gsp.access.AuthToken(),
+			},
+			OkCodes: []int{201},
+		})
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	location, err := response.HttpResponse.Location()
+	if err != nil {
+		return "", err
+	}
+
+	// Return the last element of the location which is the image id
+	locationArr := strings.Split(location.Path, "/")
+	return locationArr[len(locationArr)-1], err
+}
+
+// Stream a file as mime/multipart (application/octet-stream). The gist is
+// to stream from a file, into (the write side of) a pipe, copy the file
+// into the pipe, and then close the relevant file/pipe objects. This usually
+// gets run asynchronously so HTTP requests can read from the read side
+// of the pipe for the octet-stream. Any errors get set in ppError.
+// This code was adapted from:
+//    https://github.com/gebi/go-fileupload-example/blob/master/main.go
+func streamFile(readFrom *os.File,
+	readFromPath string,
+	writePipe *io.PipeWriter,
+	formLabel string,
+	ppErr **error) {
+
+	// Assure the file closes when exiting this function. Note that the
+	// caller should not defer this close since this function likely runs
+	// asynchronously.
+	defer readFrom.Close()
+
+	// Assure the write side of the pipe closes when exiting this function.
+	defer writePipe.Close()
+
+	// Create multipart writer into which to stream the pipe.
+	mpWriter := multipart.NewWriter(writePipe)
+
+	// Initialize the multipart writer
+	part, err := mpWriter.CreateFormFile(formLabel,
+		filepath.Base(readFromPath))
+	if err != nil {
+		*ppErr = &err
+		return
+	}
+
+	// copy from the file to stream into the multipart.
+	_, err = io.Copy(part, readFrom)
+	if err != nil {
+		*ppErr = &err
+		return
+	}
+
+	// unless closed, the multipart will not contain an ending boundary
+	err = mpWriter.Close()
+	if err != nil {
+		*ppErr = &err
+	}
+}
+
+func (gsp *genericServersProvider) UploadImageFile(imageId string,
+	imagePath string) error {
+
+	_, err := gsp.context.ResponseWithReauth(gsp.access,
+		func() (*perigee.Response, error) {
+			url := gsp.endpoint + "/images/" + imageId + "/file"
+
+			// Open the file to stream as multipart/octet-stream, but do not
+			// defer its close here since it must remain open during the
+			// streaming operation and the streamer will close it.
+			inFile, err := os.Open(imagePath)
+			if err != nil {
+				return nil, err
+			}
+
+			// Create the body io.Reader (read side of pipe) and the writer
+			// into which to write the application/octet-stream data.
+			body, mpWriter := io.Pipe()
+
+			// Startup the streamer
+			var streamErr *error
+			go streamFile(inFile, imagePath, mpWriter, "file", &streamErr)
+
+			// Run the PUT request. The body will receive the octet-stream
+			// from the streamer.
+			return perigee.Request("PUT", url, perigee.Options{
+				ReqBody:      body,
+				CustomClient: gsp.context.httpClient,
+				ContentType:  "application/octet-stream",
+				MoreHeaders: map[string]string{
+					"X-Auth-Token": gsp.access.AuthToken(),
+				},
+				OkCodes: []int{204},
+			})
+		})
+
+	return err
 }
 
 func (gsp *genericServersProvider) DeleteImageById(id string) error {
@@ -104,3 +228,46 @@ type Image struct {
 	Updated         string `json:"updated"`
 	OsDcfDiskConfig string `json:"OS-DCF:diskConfig"`
 }
+
+// NewImage structures are used to create (upload) images.
+// The fields discussed below are relevent for server-creation purposes.
+//
+// The Name field contains the desired name of the image.
+// A name is required.
+//
+// The Visibility field contains visibility of the new image.
+// If provided, this value must have either "public" or "private".
+// This field is otional and defaults to "public".
+//
+// The Tags field contains key/value association of arbitrary data for tie image.
+// This field defaults to an empty map if not provided.
+//
+// The Status field indicates the current status of the image
+// This field is a return field only.
+//
+// The CreatedAt field indicates the time at which the image got created.
+// This field is a return field only.
+//
+// The UpdatedAt field indicates the time at which the image got updated.
+// This field is a return field only.
+//
+// The UpdatedAt field indicates the time at which the image got updated.
+// This field is a return field only.
+//
+// The Self field indicates the URL to the image.
+// This field is a return field only.
+//
+// The File field indicates the file URL to the image (e.g., for a GET).
+// This field is a return field only.
+//
+// The Schema field indicates the schema of the server.
+// This a return field only.
+//
+type NewImage struct {
+	Name            string   `json:"name"`
+	Visibility      string   `json:"visibility,omitempty"`
+	ContainerFormat string   `json:"container_format"`
+	DiskFormat      string   `json:"disk_format"`
+	Tags            []string `json:"tags,omitempty"`
+}
+

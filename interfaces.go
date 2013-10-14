@@ -148,6 +148,14 @@ type CloudServersProvider interface {
 	// ImageById yields details about a specific image.
 	ImageById(id string) (*Image, error)
 
+	// CreateNewImage creates a new image record for use in later uploading.
+	// This function returns the ID of the new image.
+	CreateNewImage(newImage NewImage) (string, error)
+
+	// Uploads the contents of a file. This function
+	// returns the ID of the new image.
+	UploadImageFile(imageId string, imagePath string) error
+
 	// DeleteImageById will delete the specific image.
 	DeleteImageById(id string) error
 
