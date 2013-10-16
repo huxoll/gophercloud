@@ -3,9 +3,7 @@ package gophercloud
 import (
 	"github.com/racker/perigee"
 	"io"
-	"mime/multipart"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -97,29 +95,14 @@ func streamFile(readFrom *os.File,
 	// Assure the write side of the pipe closes when exiting this function.
 	defer writePipe.Close()
 
-	// Create multipart writer into which to stream the pipe.
-	mpWriter := multipart.NewWriter(writePipe)
-
-	// Initialize the multipart writer
-	part, err := mpWriter.CreateFormFile(formLabel,
-		filepath.Base(readFromPath))
-	if err != nil {
-		*ppErr = &err
-		return
-	}
-
 	// copy from the file to stream into the multipart.
-	_, err = io.Copy(part, readFrom)
+	_, err := io.Copy(writePipe, readFrom)
 	if err != nil {
 		*ppErr = &err
 		return
 	}
 
-	// unless closed, the multipart will not contain an ending boundary
-	err = mpWriter.Close()
-	if err != nil {
-		*ppErr = &err
-	}
+	*ppErr = nil
 }
 
 func (gsp *genericServersProvider) UploadImageFile(imageId string,
@@ -128,6 +111,14 @@ func (gsp *genericServersProvider) UploadImageFile(imageId string,
 	_, err := gsp.context.ResponseWithReauth(gsp.access,
 		func() (*perigee.Response, error) {
 			url := gsp.endpoint + "/images/" + imageId + "/file"
+
+			// Get the file size for later http header setting.
+			var fileSize int64
+			fi, err := os.Stat(imagePath)
+			if err != nil {
+				return nil, err
+			}
+			fileSize = fi.Size()
 
 			// Open the file to stream as multipart/octet-stream, but do not
 			// defer its close here since it must remain open during the
@@ -139,18 +130,19 @@ func (gsp *genericServersProvider) UploadImageFile(imageId string,
 
 			// Create the body io.Reader (read side of pipe) and the writer
 			// into which to write the application/octet-stream data.
-			body, mpWriter := io.Pipe()
+			body, writer := io.Pipe()
 
 			// Startup the streamer
 			var streamErr *error
-			go streamFile(inFile, imagePath, mpWriter, "file", &streamErr)
+			go streamFile(inFile, imagePath, writer, "file", &streamErr)
 
 			// Run the PUT request. The body will receive the octet-stream
 			// from the streamer.
 			return perigee.Request("PUT", url, perigee.Options{
-				ReqBody:      body,
-				CustomClient: gsp.context.httpClient,
-				ContentType:  "application/octet-stream",
+				ReqBody:       body,
+				CustomClient:  gsp.context.httpClient,
+				ContentType:   "application/octet-stream",
+				ContentLength: fileSize,
 				MoreHeaders: map[string]string{
 					"X-Auth-Token": gsp.access.AuthToken(),
 				},
@@ -270,4 +262,3 @@ type NewImage struct {
 	DiskFormat      string   `json:"disk_format"`
 	Tags            []string `json:"tags,omitempty"`
 }
-
